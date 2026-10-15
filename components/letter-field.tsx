@@ -20,6 +20,9 @@ const TONES: Rgb[] = [
 const RING_LIFE = 2.8;
 const RING_REACH = 460;
 const MAX_RINGS = 8;
+// Multiplier on how fast the idle patches drift and morph.
+const FLOW_SPEED = 5;
+const POINTER_RADIUS = 170;
 
 const smooth = (t: number) => t * t * (3 - 2 * t);
 const clamp01 = (v: number) => (v < 0 ? 0 : v > 1 ? 1 : v);
@@ -88,6 +91,8 @@ export default function LetterField() {
 
     const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
     const rings: Ring[] = [];
+    // x/y trail the target position, strength fades the patch in and out.
+    const pointer = { x: 0, y: 0, tx: 0, ty: 0, strength: 0, target: 0 };
     let atlas: HTMLCanvasElement;
     let glyphs = new Uint8Array(0);
     let dpr = 1;
@@ -128,17 +133,29 @@ export default function LetterField() {
       });
 
       const scale = 1 / (380 * dpr);
+      const flow = t * FLOW_SPEED;
+      const pointerRadius = POINTER_RADIUS * dpr;
       for (let cy = 0; cy < rows; cy++) {
         const y = (cy + 0.5) * ch;
         for (let cx = 0; cx < cols; cx++) {
           const x = (cx + 0.5) * cw;
           const i = cy * cols + cx;
 
-          // Two octaves drifting in different directions so the patches slowly flow and merge.
+          // Two octaves drifting in different directions so the patches flow and merge.
           const n =
-            noise(x * scale + t * 0.05, y * scale, t * 0.07) * 0.65 +
-            noise(x * scale * 2.3 - t * 0.08, y * scale * 2.3 + t * 0.04, t * 0.11 + 40) * 0.35;
-          const idle = range(n, 0.52, 0.8) * 0.7;
+            noise(x * scale + flow * 0.05, y * scale, flow * 0.07) * 0.65 +
+            noise(x * scale * 2.3 - flow * 0.08, y * scale * 2.3 + flow * 0.04, flow * 0.11 + 40) * 0.35;
+          let idle = range(n, 0.52, 0.8) * 0.7;
+
+          // A patch of the same letters follows the pointer; noise keeps its edge ragged.
+          if (pointer.strength > 0.01) {
+            const d = Math.hypot(x - pointer.x, y - pointer.y);
+            if (d < pointerRadius) {
+              const m = noise(x * scale * 2.5 + flow * 0.12, y * scale * 2.5 - flow * 0.1, flow * 0.2 + 90);
+              const core = (1 - smooth(d / pointerRadius)) * (0.55 + m * 0.9);
+              idle = Math.max(idle, range(core, 0.2, 0.7) * 0.85 * pointer.strength);
+            }
+          }
 
           let ring = 0;
           for (const r of active) {
@@ -159,7 +176,7 @@ export default function LetterField() {
           const a = click ? ring : idle;
           if (a < 0.06) continue;
 
-          if (Math.random() < (click ? 0.3 : 0.025)) {
+          if (Math.random() < (click ? 0.3 : 0.04)) {
             glyphs[i] = Math.floor(Math.random() * GLYPHS.length);
           }
           const level = Math.min(LEVELS - 1, Math.floor(a * LEVELS));
@@ -178,27 +195,62 @@ export default function LetterField() {
       }
     };
 
+    let last = origin;
     const frame = (now: number) => {
+      const dt = Math.min((now - last) / 1000, 0.1);
+      last = now;
+      pointer.x += (pointer.tx - pointer.x) * (1 - Math.exp(-dt * 9));
+      pointer.y += (pointer.ty - pointer.y) * (1 - Math.exp(-dt * 9));
+      pointer.strength += (pointer.target - pointer.strength) * (1 - Math.exp(-dt * 5));
       draw(now);
       raf = requestAnimationFrame(frame);
     };
 
+    const onPointerMove = (e: PointerEvent) => {
+      pointer.tx = e.clientX * dpr;
+      pointer.ty = e.clientY * dpr;
+      // Start under the pointer instead of sliding in from the last position.
+      if (pointer.target === 0) {
+        pointer.x = pointer.tx;
+        pointer.y = pointer.ty;
+      }
+      pointer.target = 1;
+    };
+
     const onPointerDown = (e: PointerEvent) => {
       if (reduceMotion.matches) return;
+      onPointerMove(e);
       const start = (performance.now() - origin) / 1000;
       rings.push({ x: e.clientX * dpr, y: e.clientY * dpr, start, seed: Math.random() * 100 });
       if (rings.length > MAX_RINGS) rings.shift();
     };
 
+    // A lifted finger leaves no hover position, so the patch fades out for touch input.
+    const onPointerRelease = (e: PointerEvent) => {
+      if (e.pointerType !== "mouse") pointer.target = 0;
+    };
+    const onPointerLeave = () => {
+      pointer.target = 0;
+    };
+
     resize();
     if (!reduceMotion.matches) raf = requestAnimationFrame(frame);
+    const root = document.documentElement;
     window.addEventListener("resize", resize);
     window.addEventListener("pointerdown", onPointerDown, { passive: true });
+    window.addEventListener("pointermove", onPointerMove, { passive: true });
+    window.addEventListener("pointerup", onPointerRelease, { passive: true });
+    window.addEventListener("pointercancel", onPointerRelease, { passive: true });
+    root.addEventListener("pointerleave", onPointerLeave);
 
     return () => {
       cancelAnimationFrame(raf);
       window.removeEventListener("resize", resize);
       window.removeEventListener("pointerdown", onPointerDown);
+      window.removeEventListener("pointermove", onPointerMove);
+      window.removeEventListener("pointerup", onPointerRelease);
+      window.removeEventListener("pointercancel", onPointerRelease);
+      root.removeEventListener("pointerleave", onPointerLeave);
     };
   }, []);
 
